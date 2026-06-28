@@ -1,27 +1,28 @@
 """
-DERIV SCALPER BOT v5.2
-Fixed: proposal → buy flow | Clean minimal dashboard
+DERIV SCALPER BOT v5.3
+Restored: OTP-based WS URL (PAT flow) + Fixed proposal→buy + Clean UI
 """
 
 import asyncio
 import json
 import os
 import threading
+import requests
 from datetime import datetime
 from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import websockets
 
 API_TOKEN      = os.environ.get("API_TOKEN", "")
-APP_ID         = os.environ.get("APP_ID", "1089")
+APP_ID         = os.environ.get("APP_ID", "33G9IntANaJzG3qeRKAPk")
+ACCOUNT_ID     = os.environ.get("ACCOUNT_ID", "DOT93156522")
 SYMBOL         = os.environ.get("SYMBOL", "1HZ50V")
 STAKE          = float(os.environ.get("STAKE", "0.35"))
 DURATION       = int(os.environ.get("DURATION", "5"))
 DURATION_UNIT  = os.environ.get("DURATION_UNIT", "t")
 MAX_DAILY_LOSS = float(os.environ.get("MAX_DAILY_LOSS", "3.00"))
 PORT           = int(os.environ.get("PORT", "8080"))
-
-WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+API_BASE       = "https://api.derivws.com"
 
 state = {
     "status": "Starting...",
@@ -42,14 +43,12 @@ state = {
 
 price_history = deque(maxlen=50)
 is_trading = False
-pending_proposal_id = None
 
 
 def log(msg, level="INFO"):
     icons = {"INFO": "ℹ️", "TRADE": "💰", "WIN": "✅", "LOSS": "❌", "WARN": "⚠️", "ERROR": "🔴"}
     ts = datetime.now().strftime("%H:%M:%S")
-    line = f"[{ts}] {icons.get(level, '.')} {msg}"
-    print(line, flush=True)
+    print(f"[{ts}] {icons.get(level,'.')} {msg}", flush=True)
     state["logs"].insert(0, {"time": ts, "msg": msg, "level": level})
     if len(state["logs"]) > 50:
         state["logs"].pop()
@@ -70,10 +69,10 @@ def rsi(prices, period=7):
     if len(prices) < period + 1:
         return None
     p = list(prices)
-    d = [p[i + 1] - p[i] for i in range(len(p) - 1)][-period:]
+    d = [p[i+1]-p[i] for i in range(len(p)-1)][-period:]
     g = sum(x for x in d if x > 0) / period
     l = sum(-x for x in d if x < 0) / period
-    return 100 if l == 0 else 100 - (100 / (1 + g / l))
+    return 100 if l == 0 else 100 - (100/(1+g/l))
 
 
 def get_signal():
@@ -84,7 +83,7 @@ def get_signal():
     s1 = ema(deque(p), 20)
     f0 = ema(deque(p[:-1]), 5)
     s0 = ema(deque(p[:-1]), 20)
-    r = rsi(deque(p), 7)
+    r  = rsi(deque(p), 7)
     if None in [f1, s1, f0, s0, r]:
         return None
     log(f"EMA5={f1:.2f} EMA20={s1:.2f} RSI={r:.1f}")
@@ -95,94 +94,80 @@ def get_signal():
     return None
 
 
-async def request_proposal(ws, direction):
-    """Step 1: Request a price proposal from Deriv"""
-    global pending_proposal_id
-    await ws.send(json.dumps({
-        "proposal": 1,
-        "amount": STAKE,
-        "basis": "stake",
-        "contract_type": direction,
-        "currency": "USD",
-        "duration": DURATION,
-        "duration_unit": DURATION_UNIT,
-        "symbol": SYMBOL
-    }))
-    log(f"Proposal requested: {direction}", "TRADE")
-
-
-async def buy_proposal(ws, proposal_id):
-    """Step 2: Buy the proposal once we receive it"""
-    await ws.send(json.dumps({
-        "buy": proposal_id,
-        "price": STAKE
-    }))
-    log(f"Buying proposal {proposal_id}", "TRADE")
+def get_ws_url():
+    headers = {
+        "Authorization": f"Bearer {API_TOKEN}",
+        "Deriv-App-ID": APP_ID,
+        "Content-Type": "application/json"
+    }
+    resp = requests.post(
+        f"{API_BASE}/trading/v1/options/accounts/{ACCOUNT_ID}/otp",
+        headers=headers, timeout=15
+    )
+    if resp.status_code != 200:
+        raise Exception(f"OTP failed: {resp.text}")
+    return resp.json()["data"]["url"]
 
 
 async def bot_loop():
-    global is_trading, pending_proposal_id
+    global is_trading
     while True:
         try:
             state["status"] = "Connecting..."
-            log(f"Connecting to Deriv WS (App ID: {APP_ID})...")
-            async with websockets.connect(WS_URL) as ws:
-                # Authorize
-                await ws.send(json.dumps({"authorize": API_TOKEN}))
+            log("Getting WebSocket URL...")
+            ws_url = get_ws_url()
+            log("Connecting to Deriv...")
+            async with websockets.connect(ws_url) as ws:
+                state["connected"] = True
+                state["status"] = "Live — Watching"
+                log("Connected!")
+                await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
+                await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+                log(f"Subscribed to {SYMBOL}")
 
                 async for raw in ws:
                     data = json.loads(raw)
                     msg_type = data.get("msg_type")
 
-                    # --- Auth ---
-                    if msg_type == "authorize":
-                        if "error" in data:
-                            log(f"Auth failed: {data['error']['message']}", "ERROR")
-                            state["status"] = "Auth Failed"
-                            break
-                        bal = float(data["authorize"]["balance"])
-                        state["balance"] = bal
-                        if state["start_balance"] == 0:
-                            state["start_balance"] = bal
-                        state["connected"] = True
-                        state["status"] = "Live — Watching"
-                        log(f"Authorized. Balance: ${bal:.2f}")
-                        # Subscribe to balance and ticks
-                        await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
-                        await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
-                        log(f"Subscribed to {SYMBOL}")
-
-                    # --- Live price ticks ---
-                    elif msg_type == "tick":
+                    if msg_type == "tick":
                         price = float(data["tick"]["quote"])
                         price_history.append(price)
                         state["last_price"] = price
-
                         if state["start_balance"] == 0:
                             continue
-
                         daily_loss = state["start_balance"] - state["balance"]
                         if daily_loss >= MAX_DAILY_LOSS:
                             state["status"] = "Daily loss limit hit — Paused"
                             continue
-
                         if is_trading:
                             continue
-
                         signal = get_signal()
                         if signal:
                             state["last_signal"] = signal
                             is_trading = True
                             state["is_trading"] = True
                             state["status"] = f"Trade Open ({signal})"
-                            await request_proposal(ws, signal)
+                            log(f"Signal: {signal} at {price:.4f}", "TRADE")
+                            # Step 1: request proposal
+                            await ws.send(json.dumps({
+                                "proposal": 1,
+                                "amount": STAKE,
+                                "basis": "stake",
+                                "contract_type": signal,
+                                "currency": "USD",
+                                "duration": DURATION,
+                                "duration_unit": DURATION_UNIT,
+                                "symbol": SYMBOL
+                            }))
 
-                    # --- Balance update ---
                     elif msg_type == "balance":
-                        state["balance"] = float(data["balance"]["balance"])
-                        state["daily_pnl"] = state["balance"] - state["start_balance"]
+                        bal = float(data["balance"]["balance"])
+                        if state["start_balance"] == 0:
+                            state["start_balance"] = bal
+                            log(f"Balance: ${bal:.2f}")
+                        state["balance"] = bal
+                        state["daily_pnl"] = bal - state["start_balance"]
 
-                    # --- Proposal response → buy it ---
                     elif msg_type == "proposal":
                         if "error" in data:
                             log(f"Proposal error: {data['error']['message']}", "ERROR")
@@ -191,10 +176,13 @@ async def bot_loop():
                             state["status"] = "Live — Watching"
                         else:
                             proposal_id = data["proposal"]["id"]
-                            pending_proposal_id = proposal_id
-                            await buy_proposal(ws, proposal_id)
+                            log(f"Proposal received, buying ID: {proposal_id}", "TRADE")
+                            # Step 2: buy the proposal
+                            await ws.send(json.dumps({
+                                "buy": proposal_id,
+                                "price": STAKE
+                            }))
 
-                    # --- Buy confirmation ---
                     elif msg_type == "buy":
                         if "error" in data:
                             log(f"Buy error: {data['error']['message']}", "ERROR")
@@ -211,7 +199,6 @@ async def bot_loop():
                                 "subscribe": 1
                             }))
 
-                    # --- Contract result ---
                     elif msg_type == "proposal_open_contract":
                         c = data.get("proposal_open_contract", {})
                         if c.get("is_expired") or c.get("status") in ("sold", "won", "lost"):
@@ -288,42 +275,32 @@ def build_html():
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{ background: #0d0d0d; color: #e2e8f0; font-family: 'Segoe UI', sans-serif; padding: 16px; font-size: 14px; }}
-
   .topbar {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }}
   .brand {{ font-weight: 700; font-size: 15px; letter-spacing: 1px; color: #fff; }}
   .status {{ display: flex; align-items: center; gap: 6px; font-size: 12px; color: #9ca3af; }}
   .dot {{ width: 8px; height: 8px; border-radius: 50%; background: {dot_color}; }}
-
   .cards {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }}
   .card {{ background: #161616; border: 1px solid #222; border-radius: 10px; padding: 14px; }}
   .card-label {{ font-size: 10px; color: #6b7280; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }}
   .card-value {{ font-size: 22px; font-weight: 700; font-family: monospace; }}
   .card-sub {{ font-size: 11px; color: #6b7280; margin-top: 4px; }}
-
   .price-card {{ background: #161616; border: 1px solid #222; border-radius: 10px; padding: 14px; margin-bottom: 14px; }}
   .price-big {{ font-size: 26px; font-weight: 700; font-family: monospace; color: #fff; }}
-  .price-sub {{ font-size: 11px; color: #6b7280; margin-top: 4px; }}
-
   .section-title {{ font-size: 10px; color: #4b5563; text-transform: uppercase; letter-spacing: 1.5px; margin: 14px 0 8px; }}
-
   table {{ width: 100%; border-collapse: collapse; background: #161616; border: 1px solid #222; border-radius: 10px; overflow: hidden; margin-bottom: 14px; }}
   th {{ padding: 8px 12px; font-size: 10px; color: #4b5563; text-transform: uppercase; letter-spacing: 1px; text-align: left; border-bottom: 1px solid #222; font-weight: 500; }}
   td {{ padding: 8px 12px; font-size: 12px; font-family: monospace; border-bottom: 1px solid #1a1a1a; color: #9ca3af; }}
   tr:last-child td {{ border-bottom: none; }}
   .empty {{ text-align: center; color: #374151; padding: 20px !important; }}
-
   .log-line {{ padding: 5px 10px; border-left: 2px solid #333; margin-bottom: 3px; font-size: 11px; font-family: monospace; border-radius: 0 4px 4px 0; background: #111; }}
-
   .footer {{ text-align: center; font-size: 10px; color: #374151; margin-top: 16px; padding-top: 12px; border-top: 1px solid #1a1a1a; font-family: monospace; }}
 </style>
 </head>
 <body>
-
 <div class="topbar">
   <div class="brand">⚡ SCALPER BOT</div>
   <div class="status"><div class="dot"></div>{s['status']}</div>
 </div>
-
 <div class="cards">
   <div class="card">
     <div class="card-label">Balance</div>
@@ -346,22 +323,18 @@ def build_html():
     <div class="card-sub">Max loss: ${MAX_DAILY_LOSS}</div>
   </div>
 </div>
-
 <div class="price-card">
-  <div class="card-label">Live Price — {s['symbol'] if 'symbol' in s else SYMBOL}</div>
+  <div class="card-label">Live Price — {SYMBOL}</div>
   <div class="price-big">{price_str}</div>
-  <div class="price-sub">Last signal: <b style="color:#60a5fa">{s['last_signal']}</b> &nbsp;·&nbsp; {'🔄 Trade open' if s['is_trading'] else '👁 Watching'}</div>
+  <div class="card-sub" style="margin-top:6px">Last signal: <b style="color:#60a5fa">{s['last_signal']}</b> &nbsp;·&nbsp; {'🔄 Trade open' if s['is_trading'] else '👁 Watching'}</div>
 </div>
-
 <div class="section-title">Recent Trades</div>
 <table>
   <tr><th>Time</th><th>Type</th><th>Result</th><th>Profit</th><th>Balance</th></tr>
   {trades_rows}
 </table>
-
 <div class="section-title">Bot Logs</div>
 {logs_html}
-
 <div class="footer">Auto-refresh every 4s &nbsp;·&nbsp; Started {s['started_at']}</div>
 </body>
 </html>"""
@@ -391,11 +364,11 @@ def run_server():
 
 
 if __name__ == "__main__":
-    print("DERIV SCALPER BOT v5.2", flush=True)
+    print("DERIV SCALPER BOT v5.3", flush=True)
     if not API_TOKEN:
         log("No API_TOKEN set!", "ERROR")
         exit(1)
-    log(f"Token: {API_TOKEN[:8]}... | Symbol: {SYMBOL} | Stake: ${STAKE} | App ID: {APP_ID}")
+    log(f"Token: {API_TOKEN[:8]}... | Account: {ACCOUNT_ID} | Symbol: {SYMBOL} | Stake: ${STAKE}")
     t = threading.Thread(target=run_server, daemon=True)
     t.start()
     asyncio.run(bot_loop())
