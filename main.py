@@ -1,6 +1,6 @@
 """
-DERIV SCALPER BOT v5.3
-Restored: OTP-based WS URL (PAT flow) + Fixed proposal→buy + Clean UI
+DERIV SCALPER BOT v5.4
+Fixed: trade throttle, signal quality, cooldown between trades
 """
 
 import asyncio
@@ -8,6 +8,7 @@ import json
 import os
 import threading
 import requests
+import time
 from datetime import datetime
 from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -23,6 +24,9 @@ DURATION_UNIT  = os.environ.get("DURATION_UNIT", "t")
 MAX_DAILY_LOSS = float(os.environ.get("MAX_DAILY_LOSS", "3.00"))
 PORT           = int(os.environ.get("PORT", "8080"))
 API_BASE       = "https://api.derivws.com"
+
+# Cooldown: seconds to wait after a trade completes before trading again
+TRADE_COOLDOWN = 15
 
 state = {
     "status": "Starting...",
@@ -43,6 +47,7 @@ state = {
 
 price_history = deque(maxlen=50)
 is_trading = False
+last_trade_time = 0  # timestamp of last completed trade
 
 
 def log(msg, level="INFO"):
@@ -65,7 +70,7 @@ def ema(prices, period):
     return v
 
 
-def rsi(prices, period=7):
+def rsi(prices, period=14):
     if len(prices) < period + 1:
         return None
     p = list(prices)
@@ -76,22 +81,28 @@ def rsi(prices, period=7):
 
 
 def get_signal():
-    if len(price_history) < 22:
+    if len(price_history) < 25:
         return None
     p = list(price_history)
-    f1 = ema(deque(p), 5)
-    s1 = ema(deque(p), 20)
-    f0 = ema(deque(p[:-1]), 5)
-    s0 = ema(deque(p[:-1]), 20)
-    r  = rsi(deque(p), 7)
+
+    f1 = ema(p, 5)
+    s1 = ema(p, 20)
+    f0 = ema(p[:-1], 5)
+    s0 = ema(p[:-1], 20)
+    r  = rsi(p, 14)
+
     if None in [f1, s1, f0, s0, r]:
         return None
+
     log(f"EMA5={f1:.2f} EMA20={s1:.2f} RSI={r:.1f}")
-    # CALL: EMA5 above EMA20, RSI not overbought
-    if f1 > s1 and r < 65:
+
+    # Only trade on EMA crossover + RSI confirmation (stronger signal)
+    crossed_up   = f0 <= s0 and f1 > s1   # EMA5 just crossed above EMA20
+    crossed_down = f0 >= s0 and f1 < s1   # EMA5 just crossed below EMA20
+
+    if crossed_up and r < 55:
         return "CALL"
-    # PUT: EMA5 below EMA20, RSI not oversold
-    if f1 < s1 and r > 35:
+    if crossed_down and r > 45:
         return "PUT"
     return None
 
@@ -112,7 +123,7 @@ def get_ws_url():
 
 
 async def bot_loop():
-    global is_trading
+    global is_trading, last_trade_time
     while True:
         try:
             state["status"] = "Connecting..."
@@ -135,14 +146,25 @@ async def bot_loop():
                         price = float(data["tick"]["quote"])
                         price_history.append(price)
                         state["last_price"] = price
+
                         if state["start_balance"] == 0:
                             continue
+
+                        # Daily loss guard
                         daily_loss = state["start_balance"] - state["balance"]
                         if daily_loss >= MAX_DAILY_LOSS:
                             state["status"] = "Daily loss limit hit — Paused"
                             continue
+
+                        # Skip if trade is open OR in cooldown
                         if is_trading:
                             continue
+                        cooldown_remaining = TRADE_COOLDOWN - (time.time() - last_trade_time)
+                        if cooldown_remaining > 0:
+                            state["status"] = f"Cooldown {int(cooldown_remaining)}s..."
+                            continue
+
+                        state["status"] = "Live — Watching"
                         signal = get_signal()
                         if signal:
                             state["last_signal"] = signal
@@ -150,7 +172,6 @@ async def bot_loop():
                             state["is_trading"] = True
                             state["status"] = f"Trade Open ({signal})"
                             log(f"Signal: {signal} at {price:.4f}", "TRADE")
-                            # Step 1: request proposal
                             await ws.send(json.dumps({
                                 "proposal": 1,
                                 "amount": STAKE,
@@ -178,8 +199,7 @@ async def bot_loop():
                             state["status"] = "Live — Watching"
                         else:
                             proposal_id = data["proposal"]["id"]
-                            log(f"Proposal received, buying ID: {proposal_id}", "TRADE")
-                            # Step 2: buy the proposal
+                            log(f"Proposal received, buying ID: {proposal_id[:8]}...", "TRADE")
                             await ws.send(json.dumps({
                                 "buy": proposal_id,
                                 "price": STAKE
@@ -223,7 +243,8 @@ async def bot_loop():
                             log(f"{result} ${abs(profit):.2f} | Balance: ${state['balance']:.2f}", result)
                             is_trading = False
                             state["is_trading"] = False
-                            state["status"] = "Live — Watching"
+                            last_trade_time = time.time()  # start cooldown
+                            state["status"] = f"Cooldown {TRADE_COOLDOWN}s..."
 
                     elif "error" in data:
                         log(f"Error: {data['error']['message']}", "ERROR")
@@ -231,6 +252,8 @@ async def bot_loop():
         except Exception as e:
             state["connected"] = False
             state["status"] = "Reconnecting..."
+            is_trading = False
+            state["is_trading"] = False
             log(f"Connection lost: {e} — retrying in 5s", "WARN")
             await asyncio.sleep(5)
 
@@ -366,7 +389,7 @@ def run_server():
 
 
 if __name__ == "__main__":
-    print("DERIV SCALPER BOT v5.3", flush=True)
+    print("DERIV SCALPER BOT v5.4", flush=True)
     if not API_TOKEN:
         log("No API_TOKEN set!", "ERROR")
         exit(1)
