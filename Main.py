@@ -1,213 +1,98 @@
 """
 ╔══════════════════════════════════════════════════════╗
-║         DERIV SCALPER BOT v2.0                       ║
-║   Updated for NEW Deriv API (REST + WebSocket)       ║
-║   Uses PAT token (pat_xxx) — correct format          ║
+║         DERIV SCALPER BOT v3.0 - FINAL              ║
+║   Uses: wss://ws.derivws.com/websockets/v3           ║
+║   Auth: {"authorize": "your_pat_token"}              ║
+║   Works with pat_xxx tokens from home.deriv.com      ║
 ╚══════════════════════════════════════════════════════╝
 """
 
 import asyncio
 import json
-import time
-import requests
 from datetime import datetime
 from collections import deque
 import websockets
-from config import API_TOKEN, SYMBOL, STAKE, DURATION, DURATION_UNIT, MAX_DAILY_LOSS, APP_ID
 
-# ════════════════════════════════════════════════════════
-#  STEP 1: Get OTP + WebSocket URL from Deriv REST API
-# ════════════════════════════════════════════════════════
+# ── CONFIG ───────────────────────────────────────────────────────────
+API_TOKEN      = "pat_ae8ad69e725e649f9fdd43b1a5c8f8929a0995ab3fac0221fa13452446600545"   # from home.deriv.com
+SYMBOL         = "1HZ50V"   # Volatility 50 (1s) Index
+STAKE          = 0.35       # $ per trade
+DURATION       = 5          # ticks
+DURATION_UNIT  = "t"
+MAX_DAILY_LOSS = 3.00       # stop if down $3 today
+APP_ID         = 1089       # public test app ID — works for everyone
 
-def get_account_id():
-    """Get your Deriv account ID using your PAT token."""
-    url = "https://api.derivws.com/trading/v1/options/accounts"
-    headers = {
-        "Deriv-App-ID": str(APP_ID),
-        "Authorization": f"Bearer {API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    resp = requests.get(url, headers=headers)
-    data = resp.json()
-    if resp.status_code != 200:
-        raise Exception(f"Failed to get account: {data}")
-    accounts = data.get("data", [])
-    if not accounts:
-        raise Exception("No accounts found. Make sure your token has correct permissions.")
-    # Pick first account
-    account = accounts[0]
-    log(f"Account found: {account['id']} | Type: {account.get('account_type','unknown')}")
-    return account["id"]
+WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-def get_websocket_url(account_id):
-    """Exchange PAT token for a WebSocket OTP URL."""
-    url = f"https://api.derivws.com/trading/v1/options/accounts/{account_id}/otp"
-    headers = {
-        "Deriv-App-ID": str(APP_ID),
-        "Authorization": f"Bearer {API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    resp = requests.post(url, headers=headers)
-    data = resp.json()
-    if resp.status_code != 200:
-        raise Exception(f"Failed to get WebSocket URL: {data}")
-    ws_url = data["data"]["url"]
-    log(f"WebSocket URL obtained successfully")
-    return ws_url
-
-# ════════════════════════════════════════════════════════
-#  INDICATORS
-# ════════════════════════════════════════════════════════
-
-price_history = deque(maxlen=50)
-
-def calculate_ema(prices, period):
-    if len(prices) < period:
-        return None
-    prices_list = list(prices)
-    k = 2 / (period + 1)
-    ema = sum(prices_list[:period]) / period
-    for price in prices_list[period:]:
-        ema = price * k + ema * (1 - k)
-    return ema
-
-def calculate_rsi(prices, period=7):
-    if len(prices) < period + 1:
-        return None
-    prices_list = list(prices)
-    deltas = [prices_list[i+1] - prices_list[i] for i in range(len(prices_list)-1)]
-    deltas = deltas[-period:]
-    gains  = [d for d in deltas if d > 0]
-    losses = [-d for d in deltas if d < 0]
-    avg_gain = sum(gains) / period if gains else 0
-    avg_loss = sum(losses) / period if losses else 0
-    if avg_loss == 0:
-        return 100
-    rs  = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def get_signal():
-    if len(price_history) < 22:
-        return None
-    prices = list(price_history)
-    fast_now  = calculate_ema(deque(prices),     5)
-    slow_now  = calculate_ema(deque(prices),     20)
-    fast_prev = calculate_ema(deque(prices[:-1]), 5)
-    slow_prev = calculate_ema(deque(prices[:-1]), 20)
-    rsi = calculate_rsi(deque(prices), 7)
-    if None in [fast_now, slow_now, fast_prev, slow_prev, rsi]:
-        return None
-    log(f"EMA5={fast_now:.4f} EMA20={slow_now:.4f} RSI={rsi:.1f}")
-    if fast_prev < slow_prev and fast_now > slow_now and rsi < 60:
-        return "CALL"
-    if fast_prev > slow_prev and fast_now < slow_now and rsi > 40:
-        return "PUT"
-    return None
-
-# ════════════════════════════════════════════════════════
-#  LOGGING
-# ════════════════════════════════════════════════════════
-
-def log(msg, level="INFO"):
-    icons = {"INFO":"ℹ️","TRADE":"💰","WIN":"✅","LOSS":"❌","WARN":"⚠️","ERROR":"🔴"}
-    icon  = icons.get(level, "•")
-    ts    = datetime.now().strftime("%H:%M:%S")
-    line  = f"[{ts}] {icon}  {msg}"
-    print(line)
-    with open("bot_log.txt", "a") as f:
-        f.write(line + "\n")
-
-# ════════════════════════════════════════════════════════
-#  TRADE STATE
-# ════════════════════════════════════════════════════════
-
+# ── STATE ─────────────────────────────────────────────────────────────
+price_history       = deque(maxlen=50)
 daily_start_balance = None
 current_balance     = None
 trades_today        = 0
 is_trading          = False
 active_contract_id  = None
 
-# ════════════════════════════════════════════════════════
-#  MAIN BOT
-# ════════════════════════════════════════════════════════
+# ── LOGGING ───────────────────────────────────────────────────────────
+def log(msg, level="INFO"):
+    icons = {
+        "INFO":  "ℹ️ ",
+        "TRADE": "💰",
+        "WIN":   "✅",
+        "LOSS":  "❌",
+        "WARN":  "⚠️ ",
+        "ERROR": "🔴"
+    }
+    icon = icons.get(level, "•")
+    ts   = datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] {icon} {msg}"
+    print(line)
+    with open("bot_log.txt", "a") as f:
+        f.write(line + "\n")
 
-async def run_bot(ws_url):
-    global daily_start_balance, current_balance, trades_today, is_trading, active_contract_id
+# ── INDICATORS ────────────────────────────────────────────────────────
+def ema(prices, period):
+    if len(prices) < period:
+        return None
+    p = list(prices)
+    k = 2 / (period + 1)
+    val = sum(p[:period]) / period
+    for price in p[period:]:
+        val = price * k + val * (1 - k)
+    return val
 
-    log(f"Connecting to Deriv WebSocket...")
+def rsi(prices, period=7):
+    if len(prices) < period + 1:
+        return None
+    p     = list(prices)
+    deltas = [p[i+1] - p[i] for i in range(len(p)-1)]
+    d      = deltas[-period:]
+    gains  = [x for x in d if x > 0]
+    losses = [-x for x in d if x < 0]
+    ag = sum(gains)  / period if gains  else 0
+    al = sum(losses) / period if losses else 0
+    if al == 0:
+        return 100
+    return 100 - (100 / (1 + ag / al))
 
-    async with websockets.connect(ws_url) as ws:
-        log("✅ Connected! Waiting for market data...")
+def get_signal():
+    if len(price_history) < 22:
+        return None
+    p = list(price_history)
+    f1 = ema(deque(p),     5)
+    s1 = ema(deque(p),    20)
+    f0 = ema(deque(p[:-1]), 5)
+    s0 = ema(deque(p[:-1]), 20)
+    r  = rsi(deque(p), 7)
+    if None in [f1, s1, f0, s0, r]:
+        return None
+    log(f"EMA5={f1:.4f} EMA20={s1:.4f} RSI={r:.1f}")
+    if f0 < s0 and f1 > s1 and r < 60:
+        return "CALL"
+    if f0 > s0 and f1 < s1 and r > 40:
+        return "PUT"
+    return None
 
-        # Subscribe to ticks
-        await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
-
-        # Get initial balance
-        await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
-
-        async for raw in ws:
-            data = json.loads(raw)
-            msg_type = data.get("msg_type")
-
-            if msg_type == "tick":
-                tick  = data["tick"]
-                price = float(tick["quote"])
-                price_history.append(price)
-
-                if daily_start_balance is None:
-                    continue
-
-                daily_loss = daily_start_balance - (current_balance or daily_start_balance)
-                if daily_loss >= MAX_DAILY_LOSS:
-                    log(f"🛑 Daily loss limit hit (${daily_loss:.2f}). Paused.", "WARN")
-                    continue
-
-                if is_trading:
-                    continue
-
-                signal = get_signal()
-                if signal:
-                    log(f"🎯 Signal: {signal} at {price}", "TRADE")
-                    await place_trade(ws, signal)
-
-            elif msg_type == "balance":
-                bal = float(data["balance"]["balance"])
-                if daily_start_balance is None:
-                    daily_start_balance = bal
-                    log(f"💵 Starting balance: ${bal:.2f}")
-                current_balance = bal
-
-            elif msg_type == "buy":
-                if "error" in data:
-                    log(f"Trade failed: {data['error']['message']}", "ERROR")
-                    is_trading = False
-                else:
-                    contract = data["buy"]
-                    active_contract_id = contract["contract_id"]
-                    trades_today += 1
-                    log(f"Trade #{trades_today} placed | ID: {active_contract_id}", "TRADE")
-                    await ws.send(json.dumps({
-                        "proposal_open_contract": 1,
-                        "contract_id": active_contract_id,
-                        "subscribe": 1
-                    }))
-
-            elif msg_type == "proposal_open_contract":
-                contract = data.get("proposal_open_contract", {})
-                if contract.get("is_expired") or contract.get("status") == "sold":
-                    profit = float(contract.get("profit", 0))
-                    if profit > 0:
-                        log(f"WIN! +${profit:.2f}", "WIN")
-                    else:
-                        log(f"LOSS. -${abs(profit):.2f}", "LOSS")
-                    await ws.send(json.dumps({"balance": 1}))
-                    is_trading = False
-                    active_contract_id = None
-
-            elif "error" in data:
-                log(f"API Error: {data['error']['message']}", "ERROR")
-
-
+# ── TRADE ─────────────────────────────────────────────────────────────
 async def place_trade(ws, direction):
     global is_trading
     is_trading = True
@@ -225,25 +110,102 @@ async def place_trade(ws, direction):
         }
     }))
 
-# ════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ════════════════════════════════════════════════════════
+# ── MAIN BOT LOOP ─────────────────────────────────────────────────────
+async def run():
+    global daily_start_balance, current_balance
+    global trades_today, is_trading, active_contract_id
 
+    log(f"Connecting to Deriv... ({WS_URL})")
+
+    async with websockets.connect(WS_URL) as ws:
+
+        # Step 1: Authorize
+        await ws.send(json.dumps({"authorize": API_TOKEN}))
+        resp = json.loads(await ws.recv())
+
+        if "error" in resp:
+            log(f"Auth failed: {resp['error']['message']}", "ERROR")
+            log("Check your API token in config at top of main.py", "ERROR")
+            return
+
+        balance = resp["authorize"]["balance"]
+        loginid = resp["authorize"]["loginid"]
+        daily_start_balance = float(balance)
+        current_balance     = float(balance)
+        log(f"✅ Authorized! Account: {loginid} | Balance: ${balance}", "INFO")
+
+        # Step 2: Subscribe to ticks
+        await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+        log(f"📡 Subscribed to {SYMBOL} ticks. Waiting for signals...", "INFO")
+        log(f"Need 22 ticks before first signal (~22 seconds on 1s index)", "INFO")
+
+        # Step 3: Listen
+        async for raw in ws:
+            data     = json.loads(raw)
+            msg_type = data.get("msg_type")
+
+            # ── Tick received ────────────────────────────────────────
+            if msg_type == "tick":
+                price = float(data["tick"]["quote"])
+                price_history.append(price)
+
+                # Daily loss guard
+                daily_loss = daily_start_balance - current_balance
+                if daily_loss >= MAX_DAILY_LOSS:
+                    log(f"🛑 Daily loss limit hit (${daily_loss:.2f}). Bot paused.", "WARN")
+                    continue
+
+                if is_trading:
+                    continue
+
+                signal = get_signal()
+                if signal:
+                    log(f"🎯 Signal: {signal} | Price: {price}", "TRADE")
+                    await place_trade(ws, signal)
+
+            # ── Trade placed ─────────────────────────────────────────
+            elif msg_type == "buy":
+                if "error" in data:
+                    log(f"Trade failed: {data['error']['message']}", "ERROR")
+                    is_trading = False
+                else:
+                    active_contract_id = data["buy"]["contract_id"]
+                    trades_today += 1
+                    log(f"Trade #{trades_today} open | ID: {active_contract_id} | ${STAKE}", "TRADE")
+                    await ws.send(json.dumps({
+                        "proposal_open_contract": 1,
+                        "contract_id": active_contract_id,
+                        "subscribe": 1
+                    }))
+
+            # ── Contract result ──────────────────────────────────────
+            elif msg_type == "proposal_open_contract":
+                c = data.get("proposal_open_contract", {})
+                if c.get("is_expired") or c.get("status") == "sold":
+                    profit = float(c.get("profit", 0))
+                    current_balance += profit
+                    if profit > 0:
+                        log(f"WIN! +${profit:.2f} | Balance: ${current_balance:.2f}", "WIN")
+                    else:
+                        log(f"LOSS -${abs(profit):.2f} | Balance: ${current_balance:.2f}", "LOSS")
+                    is_trading = False
+                    active_contract_id = None
+
+            # ── Errors ──────────────────────────────────────────────
+            elif "error" in data:
+                log(f"API error: {data['error']['message']}", "ERROR")
+
+# ── ENTRY ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("""
-╔══════════════════════════════════════════════════╗
-║          DERIV SCALPER BOT v2.0                  ║
-║      EMA + RSI | New API | PAT Token Support     ║
-╚══════════════════════════════════════════════════╝
+╔══════════════════════════════════════════╗
+║       DERIV SCALPER BOT v3.0            ║
+║   EMA + RSI | Safe for $10 Accounts     ║
+╚══════════════════════════════════════════╝
     """)
     try:
-        log("Step 1: Getting your Deriv account...")
-        account_id = get_account_id()
-        log("Step 2: Getting WebSocket access URL...")
-        ws_url = get_websocket_url(account_id)
-        log("Step 3: Starting trading bot...")
-        asyncio.run(run_bot(ws_url))
+        asyncio.run(run())
     except KeyboardInterrupt:
-        log("Bot stopped by user.", "WARN")
+        log("Bot stopped.", "WARN")
     except Exception as e:
-        log(f"Error: {e}", "ERROR")
+        log(f"Fatal error: {e}", "ERROR")
