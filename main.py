@@ -21,7 +21,7 @@ DURATION_UNIT  = os.environ.get("DURATION_UNIT", "t")
 MAX_DAILY_LOSS = float(os.environ.get("MAX_DAILY_LOSS", "3.00"))
 PORT           = int(os.environ.get("PORT", "8080"))
 
-WS_URL = f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}"
+WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 state = {
     "status": "Starting...",
