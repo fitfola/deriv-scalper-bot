@@ -14,7 +14,9 @@ from collections import deque
 import websockets
 
 # ── CONFIG ───────────────────────────────────────────────────────────
-API_TOKEN      = "pat_ae8ad69e725e649f9fdd43b1a5c8f8929a0995ab3fac0221fa13452446600545"   # from home.deriv.com
+import os
+API_TOKEN = os.environ.get("API_TOKEN", "")
+ # from home.deriv.com
 SYMBOL         = "1HZ50V"   # Volatility 50 (1s) Index
 STAKE          = 0.35       # $ per trade
 DURATION       = 5          # ticks
