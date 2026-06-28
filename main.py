@@ -159,7 +159,7 @@ async def bot_loop():
                                 "currency": "USD",
                                 "duration": DURATION,
                                 "duration_unit": DURATION_UNIT,
-                                "symbol": SYMBOL
+                                "instrument_id": SYMBOL
                             }))
 
                     elif msg_type == "balance":
