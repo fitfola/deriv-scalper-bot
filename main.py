@@ -111,7 +111,10 @@ def get_account_id():
     if not accounts:
         raise Exception("Could not get or create account")
     
-    account_id = accounts[0]["id"]
+    acc = accounts[0]
+account_id = acc.get("id") or acc.get("account_id") or acc.get("loginid")
+log(f"Account data keys: {list(acc.keys())}")
+
     log(f"Account ID: {account_id}")
     return account_id
 
