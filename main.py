@@ -87,9 +87,11 @@ def get_signal():
     if None in [f1, s1, f0, s0, r]:
         return None
     log(f"EMA5={f1:.2f} EMA20={s1:.2f} RSI={r:.1f}")
-    if f0 < s0 and f1 > s1 and r < 60:
+    # CALL: EMA5 above EMA20, RSI not overbought
+    if f1 > s1 and r < 65:
         return "CALL"
-    if f0 > s0 and f1 < s1 and r > 40:
+    # PUT: EMA5 below EMA20, RSI not oversold
+    if f1 < s1 and r > 35:
         return "PUT"
     return None
 
