@@ -1,6 +1,10 @@
 """
-DERIV SCALPER BOT v5.4
-Fixed: trade throttle, signal quality, cooldown between trades
+DERIV SCALPER BOT v6.0
+Strategy: RSI bounce on mean-reverting synthetic index
+- Trades RSI extremes (oversold/overbought bounces)
+- 3 consecutive loss stop
+- 15s cooldown between trades
+- Designed for small accounts ($10+)
 """
 
 import asyncio
@@ -14,19 +18,18 @@ from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import websockets
 
-API_TOKEN      = os.environ.get("API_TOKEN", "")
-APP_ID         = os.environ.get("APP_ID", "33G9IntANaJzG3qeRKAPk")
-ACCOUNT_ID     = os.environ.get("ACCOUNT_ID", "DOT93156522")
-SYMBOL         = os.environ.get("SYMBOL", "1HZ50V")
-STAKE          = float(os.environ.get("STAKE", "0.35"))
-DURATION       = int(os.environ.get("DURATION", "5"))
-DURATION_UNIT  = os.environ.get("DURATION_UNIT", "t")
-MAX_DAILY_LOSS = float(os.environ.get("MAX_DAILY_LOSS", "3.00"))
-PORT           = int(os.environ.get("PORT", "8080"))
-API_BASE       = "https://api.derivws.com"
-
-# Cooldown: seconds to wait after a trade completes before trading again
-TRADE_COOLDOWN = 15
+API_TOKEN       = os.environ.get("API_TOKEN", "")
+APP_ID          = os.environ.get("APP_ID", "33G9IntANaJzG3qeRKAPk")
+ACCOUNT_ID      = os.environ.get("ACCOUNT_ID", "DOT93156522")
+SYMBOL          = os.environ.get("SYMBOL", "1HZ50V")
+STAKE           = float(os.environ.get("STAKE", "0.35"))
+DURATION        = int(os.environ.get("DURATION", "5"))
+DURATION_UNIT   = os.environ.get("DURATION_UNIT", "t")
+MAX_DAILY_LOSS  = float(os.environ.get("MAX_DAILY_LOSS", "3.00"))
+MAX_CONSEC_LOSS = int(os.environ.get("MAX_CONSEC_LOSS", "3"))
+TRADE_COOLDOWN  = int(os.environ.get("TRADE_COOLDOWN", "15"))
+PORT            = int(os.environ.get("PORT", "8080"))
+API_BASE        = "https://api.derivws.com"
 
 state = {
     "status": "Starting...",
@@ -37,17 +40,19 @@ state = {
     "trades_today": 0,
     "wins": 0,
     "losses": 0,
+    "consec_losses": 0,
     "daily_pnl": 0.0,
     "last_signal": "—",
     "last_price": 0.0,
     "logs": [],
     "is_trading": False,
+    "paused": False,
     "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 }
 
-price_history = deque(maxlen=50)
+price_history = deque(maxlen=60)
 is_trading = False
-last_trade_time = 0  # timestamp of last completed trade
+last_trade_time = 0
 
 
 def log(msg, level="INFO"):
@@ -57,6 +62,18 @@ def log(msg, level="INFO"):
     state["logs"].insert(0, {"time": ts, "msg": msg, "level": level})
     if len(state["logs"]) > 50:
         state["logs"].pop()
+
+
+def rsi(prices, period=7):
+    if len(prices) < period + 1:
+        return None
+    p = list(prices)[-period-1:]
+    d = [p[i+1]-p[i] for i in range(len(p)-1)]
+    g = sum(x for x in d if x > 0) / period
+    l = sum(-x for x in d if x < 0) / period
+    if l == 0:
+        return 100
+    return 100 - (100 / (1 + g/l))
 
 
 def ema(prices, period):
@@ -70,40 +87,35 @@ def ema(prices, period):
     return v
 
 
-def rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return None
-    p = list(prices)
-    d = [p[i+1]-p[i] for i in range(len(p)-1)][-period:]
-    g = sum(x for x in d if x > 0) / period
-    l = sum(-x for x in d if x < 0) / period
-    return 100 if l == 0 else 100 - (100/(1+g/l))
-
-
 def get_signal():
-    if len(price_history) < 25:
+    """
+    RSI Bounce Strategy for mean-reverting synthetic index (1HZ50V):
+    - CALL when RSI is deeply oversold (< 25) and starting to recover
+    - PUT when RSI is deeply overbought (> 75) and starting to fade
+    - Confirmed by EMA5 vs EMA20 trend direction
+    """
+    if len(price_history) < 20:
         return None
+
     p = list(price_history)
+    r_now = rsi(p, 7)
+    r_prev = rsi(p[:-1], 7)
+    e5 = ema(p, 5)
+    e20 = ema(p, 20)
 
-    f1 = ema(p, 5)
-    s1 = ema(p, 20)
-    f0 = ema(p[:-1], 5)
-    s0 = ema(p[:-1], 20)
-    r  = rsi(p, 14)
-
-    if None in [f1, s1, f0, s0, r]:
+    if None in [r_now, r_prev, e5, e20]:
         return None
 
-    log(f"EMA5={f1:.2f} EMA20={s1:.2f} RSI={r:.1f}")
+    log(f"RSI={r_now:.1f} (was {r_prev:.1f}) EMA5={e5:.1f} EMA20={e20:.1f}")
 
-    # Only trade on EMA crossover + RSI confirmation (stronger signal)
-    crossed_up   = f0 <= s0 and f1 > s1   # EMA5 just crossed above EMA20
-    crossed_down = f0 >= s0 and f1 < s1   # EMA5 just crossed below EMA20
-
-    if crossed_up and r < 55:
+    # CALL: RSI was oversold and is now recovering upward
+    if r_prev < 25 and r_now > r_prev and e5 >= e20:
         return "CALL"
-    if crossed_down and r > 45:
+
+    # PUT: RSI was overbought and is now fading downward
+    if r_prev > 75 and r_now < r_prev and e5 <= e20:
         return "PUT"
+
     return None
 
 
@@ -127,7 +139,6 @@ async def bot_loop():
     while True:
         try:
             state["status"] = "Connecting..."
-            log("Getting WebSocket URL...")
             ws_url = get_ws_url()
             log("Connecting to Deriv...")
             async with websockets.connect(ws_url) as ws:
@@ -136,7 +147,7 @@ async def bot_loop():
                 log("Connected!")
                 await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
                 await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
-                log(f"Subscribed to {SYMBOL}")
+                log(f"Watching {SYMBOL} | Stake: ${STAKE} | Max loss streak: {MAX_CONSEC_LOSS}")
 
                 async for raw in ws:
                     data = json.loads(raw)
@@ -150,18 +161,26 @@ async def bot_loop():
                         if state["start_balance"] == 0:
                             continue
 
-                        # Daily loss guard
-                        daily_loss = state["start_balance"] - state["balance"]
-                        if daily_loss >= MAX_DAILY_LOSS:
-                            state["status"] = "Daily loss limit hit — Paused"
+                        # Guard: daily loss limit
+                        if state["balance"] - state["start_balance"] <= -MAX_DAILY_LOSS:
+                            state["status"] = "🛑 Daily loss limit — Paused"
+                            state["paused"] = True
                             continue
 
-                        # Skip if trade is open OR in cooldown
+                        # Guard: consecutive loss streak
+                        if state["consec_losses"] >= MAX_CONSEC_LOSS:
+                            state["status"] = f"🛑 {MAX_CONSEC_LOSS} losses in a row — Paused"
+                            state["paused"] = True
+                            continue
+
                         if is_trading:
                             continue
-                        cooldown_remaining = TRADE_COOLDOWN - (time.time() - last_trade_time)
-                        if cooldown_remaining > 0:
-                            state["status"] = f"Cooldown {int(cooldown_remaining)}s..."
+
+                        # Cooldown between trades
+                        elapsed = time.time() - last_trade_time
+                        if elapsed < TRADE_COOLDOWN:
+                            remaining = int(TRADE_COOLDOWN - elapsed)
+                            state["status"] = f"⏳ Cooldown {remaining}s"
                             continue
 
                         state["status"] = "Live — Watching"
@@ -170,8 +189,8 @@ async def bot_loop():
                             state["last_signal"] = signal
                             is_trading = True
                             state["is_trading"] = True
-                            state["status"] = f"Trade Open ({signal})"
-                            log(f"Signal: {signal} at {price:.4f}", "TRADE")
+                            state["status"] = f"🔄 Trade Open ({signal})"
+                            log(f"Signal: {signal} @ {price:.2f}", "TRADE")
                             await ws.send(json.dumps({
                                 "proposal": 1,
                                 "amount": STAKE,
@@ -187,7 +206,7 @@ async def bot_loop():
                         bal = float(data["balance"]["balance"])
                         if state["start_balance"] == 0:
                             state["start_balance"] = bal
-                            log(f"Balance: ${bal:.2f}")
+                            log(f"Starting balance: ${bal:.2f}")
                         state["balance"] = bal
                         state["daily_pnl"] = bal - state["start_balance"]
 
@@ -196,25 +215,20 @@ async def bot_loop():
                             log(f"Proposal error: {data['error']['message']}", "ERROR")
                             is_trading = False
                             state["is_trading"] = False
-                            state["status"] = "Live — Watching"
                         else:
-                            proposal_id = data["proposal"]["id"]
-                            log(f"Proposal received, buying ID: {proposal_id[:8]}...", "TRADE")
-                            await ws.send(json.dumps({
-                                "buy": proposal_id,
-                                "price": STAKE
-                            }))
+                            pid = data["proposal"]["id"]
+                            log(f"Got proposal, buying...", "TRADE")
+                            await ws.send(json.dumps({"buy": pid, "price": STAKE}))
 
                     elif msg_type == "buy":
                         if "error" in data:
                             log(f"Buy error: {data['error']['message']}", "ERROR")
                             is_trading = False
                             state["is_trading"] = False
-                            state["status"] = "Live — Watching"
                         else:
                             cid = data["buy"]["contract_id"]
                             state["trades_today"] += 1
-                            log(f"Trade open — Contract ID: {cid}", "TRADE")
+                            log(f"Contract open: {cid}", "TRADE")
                             await ws.send(json.dumps({
                                 "proposal_open_contract": 1,
                                 "contract_id": cid,
@@ -227,10 +241,14 @@ async def bot_loop():
                             profit = float(c.get("profit", 0))
                             state["daily_pnl"] = state["balance"] - state["start_balance"]
                             result = "WIN" if profit > 0 else "LOSS"
+
                             if profit > 0:
                                 state["wins"] += 1
+                                state["consec_losses"] = 0  # reset streak on win
                             else:
                                 state["losses"] += 1
+                                state["consec_losses"] += 1
+
                             state["trades"].insert(0, {
                                 "time": datetime.now().strftime("%H:%M:%S"),
                                 "type": state["last_signal"],
@@ -240,21 +258,21 @@ async def bot_loop():
                             })
                             if len(state["trades"]) > 20:
                                 state["trades"].pop()
-                            log(f"{result} ${abs(profit):.2f} | Balance: ${state['balance']:.2f}", result)
+
+                            log(f"{result} ${abs(profit):.2f} | Bal: ${state['balance']:.2f} | Streak: {state['consec_losses']} losses", result)
                             is_trading = False
                             state["is_trading"] = False
-                            last_trade_time = time.time()  # start cooldown
-                            state["status"] = f"Cooldown {TRADE_COOLDOWN}s..."
+                            last_trade_time = time.time()
 
                     elif "error" in data:
-                        log(f"Error: {data['error']['message']}", "ERROR")
+                        log(f"WS error: {data['error']['message']}", "ERROR")
 
         except Exception as e:
             state["connected"] = False
             state["status"] = "Reconnecting..."
             is_trading = False
             state["is_trading"] = False
-            log(f"Connection lost: {e} — retrying in 5s", "WARN")
+            log(f"Lost connection: {e} — retry in 5s", "WARN")
             await asyncio.sleep(5)
 
 
@@ -266,6 +284,8 @@ def build_html():
     pnl_color = "#22c55e" if pnl >= 0 else "#ef4444"
     pnl_sign = "+" if pnl >= 0 else ""
     dot_color = "#22c55e" if s["connected"] else "#f59e0b"
+    streak = s["consec_losses"]
+    streak_color = "#ef4444" if streak >= 2 else "#f59e0b" if streak == 1 else "#22c55e"
 
     trades_rows = ""
     for t in s["trades"]:
@@ -274,18 +294,17 @@ def build_html():
         trades_rows += f"""<tr>
           <td>{t['time']}</td>
           <td style="color:#60a5fa">{t['type']}</td>
-          <td style="color:{color}">{t['result']}</td>
+          <td style="color:{color};font-weight:700">{t['result']}</td>
           <td style="color:{color}">{ps}${abs(t['profit']):.2f}</td>
           <td>${t['balance']:.2f}</td>
         </tr>"""
     if not trades_rows:
-        trades_rows = '<tr><td colspan="5" class="empty">No trades yet — watching for signals...</td></tr>'
+        trades_rows = '<tr><td colspan="5" class="empty">Waiting for RSI signal...</td></tr>'
 
     logs_html = ""
-    level_colors = {"WIN": "#22c55e", "LOSS": "#ef4444", "TRADE": "#60a5fa",
-                    "WARN": "#f59e0b", "ERROR": "#ef4444", "INFO": "#6b7280"}
-    for l in s["logs"][:15]:
-        c = level_colors.get(l["level"], "#6b7280")
+    lc = {"WIN":"#22c55e","LOSS":"#ef4444","TRADE":"#60a5fa","WARN":"#f59e0b","ERROR":"#ef4444","INFO":"#4b5563"}
+    for l in s["logs"][:12]:
+        c = lc.get(l["level"], "#4b5563")
         logs_html += f'<div class="log-line" style="border-left-color:{c};color:{c}">[{l["time"]}] {l["msg"]}</div>'
 
     price_str = f"{s['last_price']:.4f}" if s["last_price"] else "—"
@@ -298,27 +317,28 @@ def build_html():
 <meta http-equiv="refresh" content="4">
 <title>Scalper Bot</title>
 <style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ background: #0d0d0d; color: #e2e8f0; font-family: 'Segoe UI', sans-serif; padding: 16px; font-size: 14px; }}
-  .topbar {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }}
-  .brand {{ font-weight: 700; font-size: 15px; letter-spacing: 1px; color: #fff; }}
-  .status {{ display: flex; align-items: center; gap: 6px; font-size: 12px; color: #9ca3af; }}
-  .dot {{ width: 8px; height: 8px; border-radius: 50%; background: {dot_color}; }}
-  .cards {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }}
-  .card {{ background: #161616; border: 1px solid #222; border-radius: 10px; padding: 14px; }}
-  .card-label {{ font-size: 10px; color: #6b7280; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }}
-  .card-value {{ font-size: 22px; font-weight: 700; font-family: monospace; }}
-  .card-sub {{ font-size: 11px; color: #6b7280; margin-top: 4px; }}
-  .price-card {{ background: #161616; border: 1px solid #222; border-radius: 10px; padding: 14px; margin-bottom: 14px; }}
-  .price-big {{ font-size: 26px; font-weight: 700; font-family: monospace; color: #fff; }}
-  .section-title {{ font-size: 10px; color: #4b5563; text-transform: uppercase; letter-spacing: 1.5px; margin: 14px 0 8px; }}
-  table {{ width: 100%; border-collapse: collapse; background: #161616; border: 1px solid #222; border-radius: 10px; overflow: hidden; margin-bottom: 14px; }}
-  th {{ padding: 8px 12px; font-size: 10px; color: #4b5563; text-transform: uppercase; letter-spacing: 1px; text-align: left; border-bottom: 1px solid #222; font-weight: 500; }}
-  td {{ padding: 8px 12px; font-size: 12px; font-family: monospace; border-bottom: 1px solid #1a1a1a; color: #9ca3af; }}
-  tr:last-child td {{ border-bottom: none; }}
-  .empty {{ text-align: center; color: #374151; padding: 20px !important; }}
-  .log-line {{ padding: 5px 10px; border-left: 2px solid #333; margin-bottom: 3px; font-size: 11px; font-family: monospace; border-radius: 0 4px 4px 0; background: #111; }}
-  .footer {{ text-align: center; font-size: 10px; color: #374151; margin-top: 16px; padding-top: 12px; border-top: 1px solid #1a1a1a; font-family: monospace; }}
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:#0a0a0a;color:#e2e8f0;font-family:'Segoe UI',sans-serif;padding:16px;font-size:14px}}
+  .topbar{{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}}
+  .brand{{font-weight:700;font-size:15px;color:#fff;letter-spacing:1px}}
+  .status{{display:flex;align-items:center;gap:6px;font-size:11px;color:#9ca3af}}
+  .dot{{width:8px;height:8px;border-radius:50%;background:{dot_color}}}
+  .cards{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}}
+  .card{{background:#141414;border:1px solid #1f1f1f;border-radius:12px;padding:14px}}
+  .lbl{{font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px}}
+  .val{{font-size:21px;font-weight:700;font-family:monospace}}
+  .sub{{font-size:11px;color:#6b7280;margin-top:4px}}
+  .price-card{{background:#141414;border:1px solid #1f1f1f;border-radius:12px;padding:14px;margin-bottom:12px}}
+  .price-big{{font-size:24px;font-weight:700;font-family:monospace;color:#fff}}
+  .strat-box{{background:#0f1a0f;border:1px solid #1a2e1a;border-radius:12px;padding:12px;margin-bottom:12px;font-size:11px;color:#4ade80;line-height:1.6}}
+  .sec{{font-size:10px;color:#374151;text-transform:uppercase;letter-spacing:1.5px;margin:12px 0 6px}}
+  table{{width:100%;border-collapse:collapse;background:#141414;border:1px solid #1f1f1f;border-radius:12px;overflow:hidden;margin-bottom:12px}}
+  th{{padding:7px 10px;font-size:10px;color:#4b5563;text-transform:uppercase;letter-spacing:1px;text-align:left;border-bottom:1px solid #1f1f1f;font-weight:500}}
+  td{{padding:7px 10px;font-size:12px;font-family:monospace;border-bottom:1px solid #111;color:#9ca3af}}
+  tr:last-child td{{border-bottom:none}}
+  .empty{{text-align:center;color:#374151;padding:18px!important}}
+  .log-line{{padding:4px 8px;border-left:2px solid #333;margin-bottom:2px;font-size:11px;font-family:monospace;border-radius:0 4px 4px 0;background:#0d0d0d}}
+  .footer{{text-align:center;font-size:10px;color:#374151;margin-top:14px;padding-top:10px;border-top:1px solid #1a1a1a}}
 </style>
 </head>
 <body>
@@ -326,41 +346,53 @@ def build_html():
   <div class="brand">⚡ SCALPER BOT</div>
   <div class="status"><div class="dot"></div>{s['status']}</div>
 </div>
+
 <div class="cards">
   <div class="card">
-    <div class="card-label">Balance</div>
-    <div class="card-value" style="color:#22c55e">${s['balance']:.2f}</div>
-    <div class="card-sub">Start: ${s['start_balance']:.2f}</div>
+    <div class="lbl">Balance</div>
+    <div class="val" style="color:#22c55e">${s['balance']:.2f}</div>
+    <div class="sub">Start: ${s['start_balance']:.2f}</div>
   </div>
   <div class="card">
-    <div class="card-label">Today P&L</div>
-    <div class="card-value" style="color:{pnl_color}">{pnl_sign}${abs(pnl):.2f}</div>
-    <div class="card-sub">{s['trades_today']} trades</div>
+    <div class="lbl">Today P&L</div>
+    <div class="val" style="color:{pnl_color}">{pnl_sign}${abs(pnl):.2f}</div>
+    <div class="sub">{s['trades_today']} trades today</div>
   </div>
   <div class="card">
-    <div class="card-label">Wins</div>
-    <div class="card-value" style="color:#22c55e">{s['wins']}</div>
-    <div class="card-sub">Win rate: {winrate}%</div>
+    <div class="lbl">Win Rate</div>
+    <div class="val" style="color:#22c55e">{winrate}%</div>
+    <div class="sub">{s['wins']}W / {s['losses']}L</div>
   </div>
   <div class="card">
-    <div class="card-label">Losses</div>
-    <div class="card-value" style="color:#ef4444">{s['losses']}</div>
-    <div class="card-sub">Max loss: ${MAX_DAILY_LOSS}</div>
+    <div class="lbl">Loss Streak</div>
+    <div class="val" style="color:{streak_color}">{streak}</div>
+    <div class="sub">Max allowed: {MAX_CONSEC_LOSS}</div>
   </div>
 </div>
+
 <div class="price-card">
-  <div class="card-label">Live Price — {SYMBOL}</div>
+  <div class="lbl">Live Price — {SYMBOL}</div>
   <div class="price-big">{price_str}</div>
-  <div class="card-sub" style="margin-top:6px">Last signal: <b style="color:#60a5fa">{s['last_signal']}</b> &nbsp;·&nbsp; {'🔄 Trade open' if s['is_trading'] else '👁 Watching'}</div>
+  <div class="sub" style="margin-top:6px">Signal: <b style="color:#60a5fa">{s['last_signal']}</b> &nbsp;·&nbsp; {'🔄 Trade open' if s['is_trading'] else '👁 Watching'}</div>
 </div>
-<div class="section-title">Recent Trades</div>
+
+<div class="strat-box">
+  📊 <b>Strategy:</b> RSI Bounce on {SYMBOL}<br>
+  🟢 CALL when RSI &lt; 25 (oversold bounce) + EMA trend up<br>
+  🔴 PUT when RSI &gt; 75 (overbought fade) + EMA trend down<br>
+  ⏱ {TRADE_COOLDOWN}s cooldown · 🛑 Stops after {MAX_CONSEC_LOSS} consecutive losses
+</div>
+
+<div class="sec">Recent Trades</div>
 <table>
   <tr><th>Time</th><th>Type</th><th>Result</th><th>Profit</th><th>Balance</th></tr>
   {trades_rows}
 </table>
-<div class="section-title">Bot Logs</div>
+
+<div class="sec">Bot Logs</div>
 {logs_html}
-<div class="footer">Auto-refresh every 4s &nbsp;·&nbsp; Started {s['started_at']}</div>
+
+<div class="footer">Refresh every 4s · Started {s['started_at']} · Stake ${STAKE} · Max loss ${MAX_DAILY_LOSS}</div>
 </body>
 </html>"""
 
@@ -384,16 +416,16 @@ class Handler(BaseHTTPRequestHandler):
 
 def run_server():
     server = HTTPServer(("0.0.0.0", PORT), Handler)
-    log(f"Dashboard running on port {PORT}")
+    log(f"Dashboard on port {PORT}")
     server.serve_forever()
 
 
 if __name__ == "__main__":
-    print("DERIV SCALPER BOT v5.4", flush=True)
+    print("DERIV SCALPER BOT v6.0", flush=True)
     if not API_TOKEN:
         log("No API_TOKEN set!", "ERROR")
         exit(1)
-    log(f"Token: {API_TOKEN[:8]}... | Account: {ACCOUNT_ID} | Symbol: {SYMBOL} | Stake: ${STAKE}")
+    log(f"Account: {ACCOUNT_ID} | Symbol: {SYMBOL} | Stake: ${STAKE} | Cooldown: {TRADE_COOLDOWN}s")
     t = threading.Thread(target=run_server, daemon=True)
     t.start()
     asyncio.run(bot_loop())
